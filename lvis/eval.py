@@ -229,6 +229,7 @@ class LVISEval:
 
         gt_ig = np.array([g["_ignore"] for g in gt])
         dt_ig = np.zeros((num_thrs, num_dt))
+        dt_iou = np.zeros((num_thrs, num_dt))
 
         for iou_thr_idx, iou_thr in enumerate(self.params.iou_thrs):
             if len(ious) == 0:
@@ -263,6 +264,7 @@ class LVISEval:
                 # _dt match found, update gt_m, and dt_m with "id"
                 dt_m[iou_thr_idx, dt_idx] = gt[m]["id"]
                 gt_m[iou_thr_idx, m] = _dt["id"]
+                dt_iou[iou_thr_idx, dt_idx] = iou
 
         # For LVIS we will ignore any unmatched detection if that category was
         # not exhaustively annotated in gt.
@@ -288,6 +290,7 @@ class LVISEval:
             "dt_scores": [d["score"] for d in dt],
             "gt_ignore": gt_ig,
             "dt_ignore": dt_ig,
+            "dt_ious": dt_iou,
         }
 
     def accumulate(self):
@@ -315,6 +318,12 @@ class LVISEval:
             (num_thrs, num_recalls, num_cats, num_area_rngs)
         )
         recall = -np.ones((num_thrs, num_cats, num_area_rngs))
+
+        olrp_loc = -np.ones((num_cats, num_area_rngs))
+        olrp_fp = -np.ones((num_cats, num_area_rngs))
+        olrp_fn = -np.ones((num_cats, num_area_rngs))
+        olrp = -np.ones((num_cats, num_area_rngs))
+        lrp_opt_thr = -np.ones((num_cats, num_area_rngs))
 
         # Initialize dt_pointers
         dt_pointers = {}
@@ -347,6 +356,7 @@ class LVISEval:
 
                 dt_m = np.concatenate([e["dt_matches"] for e in E], axis=1)[:, dt_idx]
                 dt_ig = np.concatenate([e["dt_ignore"] for e in E], axis=1)[:, dt_idx]
+                dt_iou = np.concatenate([e["dt_ious"] for e in E], axis=1)[:, dt_idx]
 
                 gt_ig = np.concatenate([e["gt_ignore"] for e in E])
                 # num gt anns to consider
@@ -358,6 +368,7 @@ class LVISEval:
                 tps = np.logical_and(dt_m, np.logical_not(dt_ig))
                 fps = np.logical_and(np.logical_not(dt_m), np.logical_not(dt_ig))
 
+                dt_iou = np.multiply(dt_iou, tps)
                 tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float)
                 fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
 
@@ -404,6 +415,39 @@ class LVISEval:
                         pass
                     precision[iou_thr_idx, :, cat_idx, area_idx] = np.array(pr_at_recall)
 
+                # oLRP and Opt.Thr. Computation
+                tp_num = np.cumsum(tps[0, :])
+                fp_num = np.cumsum(fps[0, :])
+                fn_num = num_gt - tp_num
+                # If there is detection
+                if tp_num.shape[0] > 0:
+                    # There is some TPs
+                    if tp_num[-1] > 0:
+                        total_loc = tp_num - np.cumsum(dt_iou[0, :])
+                        lrps = (total_loc / (1 - self.params.iou_thrs[0]) + fp_num +
+                                fn_num) / (tp_num + fp_num + fn_num)
+                        opt_pos_idx = np.argmin(lrps)
+                        olrp[cat_idx, area_idx] = lrps[opt_pos_idx]
+                        olrp_loc[cat_idx, area_idx] = total_loc[opt_pos_idx] / \
+                            tp_num[opt_pos_idx]
+                        olrp_fp[cat_idx, area_idx] = fp_num[opt_pos_idx] / \
+                            (tp_num[opt_pos_idx] + fp_num[opt_pos_idx])
+                        olrp_fn[cat_idx, area_idx] = fn_num[opt_pos_idx] / num_gt
+                        lrp_opt_thr[cat_idx, area_idx] = dt_scores[opt_pos_idx]
+                    # There is No TP
+                    else:
+                        olrp_loc[cat_idx, area_idx] = np.nan
+                        olrp_fp[cat_idx, area_idx] = np.nan
+                        olrp_fn[cat_idx, area_idx] = 1.
+                        olrp[cat_idx, area_idx] = 1.
+                        lrp_opt_thr[cat_idx, area_idx] = np.nan
+                # No detection
+                else:
+                    olrp_loc[cat_idx, area_idx] = np.nan
+                    olrp_fp[cat_idx, area_idx] = np.nan
+                    olrp_fn[cat_idx, area_idx] = 1.
+                    olrp[cat_idx, area_idx] = 1.
+                    lrp_opt_thr[cat_idx, area_idx] = np.nan
         self.eval = {
             "params": self.params,
             "counts": [num_thrs, num_recalls, num_cats, num_area_rngs],
@@ -411,6 +455,11 @@ class LVISEval:
             "precision": precision,
             "recall": recall,
             "dt_pointers": dt_pointers,
+            'olrp_loc': olrp_loc,
+            'olrp_fp': olrp_fp,
+            'olrp_fn': olrp_fn,
+            'olrp': olrp,
+            'lrp_opt_thr': lrp_opt_thr,
         }
 
     def _summarize(
@@ -431,13 +480,39 @@ class LVISEval:
                 s = s[:, :, self.freq_groups[freq_group_idx], aidx]
             else:
                 s = s[:, :, :, aidx]
-        else:
+        elif summary_type == 'ar':
             s = self.eval["recall"]
             if iou_thr is not None:
                 tidx = np.where(iou_thr == self.params.iou_thrs)[0]
                 s = s[tidx]
             s = s[:, :, aidx]
+        else:
+            # # dimension of LRP: [KxAxM]
+            if summary_type == 'oLRP':
+                s = self.eval['olrp'][:, aidx]
+                titleStr = 'Optimal LRP'
+                typeStr = '    '
+            elif summary_type == 'oLRP_loc':
+                s = self.eval['olrp_loc'][:, aidx]
+                titleStr = 'Optimal LRP Loc'
+                typeStr = '    '
+            elif summary_type == 'oLRP_fp':
+                s = self.eval['olrp_fp'][:, aidx]
+                titleStr = 'Optimal LRP FP'
+                typeStr = '    '
+            elif summary_type == 'oLRP_fn':
+                s = self.eval['olrp_fn'][:, aidx]
+                titleStr = 'Optimal LRP FN'
+                typeStr = '    '
+            elif summary_type == 'LRP_thr':
+                s = self.eval['lrp_opt_thr'][:, aidx].squeeze(axis=1)
+                # Floor by using 3 decimal digits
+                return np.round(s - 0.5 * 10**(-3), 3)
+            if freq_group_idx is not None:
+                s = s[self.freq_groups[freq_group_idx], :]
 
+        idx = (~np.isnan(s))
+        s = s[idx]
         if len(s[s > -1]) == 0:
             mean_s = -1
         else:
@@ -468,6 +543,15 @@ class LVISEval:
             key = "AR{}@{}".format(area_rng[0], max_dets)
             self.results[key] = self._summarize('ar', area_rng=area_rng)
 
+        self.results["oLRP"]  = self._summarize('oLRP')
+        self.results["oLRP LOC"]  = self._summarize('oLRP_loc')
+        self.results["oLRP FP"]  = self._summarize('oLRP_fp')
+        self.results["oLRP FN"]  = self._summarize('oLRP_fn')
+        self.results["oLRPr"]  = self._summarize('oLRP', freq_group_idx=0)
+        self.results["oLRPc"]  = self._summarize('oLRP', freq_group_idx=1)
+        self.results["oLRPf"]  = self._summarize('oLRP', freq_group_idx=2)
+        self.results["LRP Opt Thr"]  = self._summarize('LRP_thr')
+
     def run(self):
         """Wrapper function which calculates the results."""
         self.evaluate()
@@ -482,29 +566,50 @@ class LVISEval:
             if "AP" in key:
                 title = "Average Precision"
                 _type = "(AP)"
-            else:
+            elif "AR" in key:
                 title = "Average Recall"
                 _type = "(AR)"
+            elif "oLRP" in key:
+                title = "oLRP"
+                if "LOC" in key:
+                    _type = "Loc "
+                elif "FP" in key:
+                    _type = "FP  "
+                elif "FN" in key:
+                    _type = "FN  "
+                else:
+                    _type = "    "
+                iou = "{:0.2f}".format(0.50)
+            else:
+                continue
 
             if len(key) > 2 and key[2].isdigit():
-                iou_thr = (float(key[2:]) / 100)
+                iou_thr = (float(key[-2:]) / 100)
                 iou = "{:0.2f}".format(iou_thr)
-            else:
+            elif  "oLRP" not in key:
                 iou = "{:0.2f}:{:0.2f}".format(
                     self.params.iou_thrs[0], self.params.iou_thrs[-1]
                 )
 
-            if len(key) > 2 and key[2] in ["r", "c", "f"]:
-                cat_group_name = key[2]
+            if len(key) > 2 and key[-1] in ["r", "c", "f"]:
+                cat_group_name = key[-1]
             else:
                 cat_group_name = "all"
 
-            if len(key) > 2 and key[2] in ["s", "m", "l"]:
-                area_rng = key[2]
+            if len(key) > 2 and key[-1] in ["s", "m", "l"]:
+                area_rng = key[-1]
             else:
                 area_rng = "all"
 
             print(template.format(title, _type, iou, area_rng, max_dets, cat_group_name, value))
+
+    def print_lrp_opt_thresholds(self):
+        np.set_printoptions(threshold=np.inf)
+        title = '# Class-specific LRP-Optimal Thresholds # \n'
+        print(title, np.round(self.results["LRP Opt Thr"] - 0.5 * 10**(-3), 3))
+        print("If LRP-Optimal Threshold of a class is: ")
+        print("nan: NO True Positive from that class ")
+        print("-1 : NO Ground Truth from that class")
 
     def get_results(self):
         if not self.results:

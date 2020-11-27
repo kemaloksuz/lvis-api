@@ -10,3 +10,5 @@ ANN_TYPE = 'bbox'
 lvis_eval = LVISEval(ANNOTATION_PATH, RESULT_PATH, ANN_TYPE)
 lvis_eval.run()
 lvis_eval.print_results()
+# Uncomment to print class-specific LRP-Optimal Thresholds
+# lvis_eval.print_lrp_opt_thresholds()
